@@ -1,43 +1,26 @@
 #!/usr/bin/env python
 """Main module of kube-schedule-scaler"""
 
-import concurrent.futures
+import asyncio
 import json
 import logging
 import os
-import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from functools import partial
-from queue import Queue
-from signal import SIGABRT, SIGINT, SIGQUIT, SIGTERM, signal, strsignal
-from sys import exit
-from types import FrameType
-from typing import cast
+from typing import Coroutine, cast
 
 import dateutil
 from croniter import croniter
-from kubernetes import client, config, watch
-from kubernetes.client.models import V1Deployment, V1ObjectMeta
-from kubernetes.client.rest import ApiException
+from kubernetes_asyncio import client, config, watch
+from kubernetes_asyncio.client.models import V1Deployment, V1ObjectMeta
+from kubernetes_asyncio.client.rest import ApiException
 
-# client is shared across the program
-try:
-    config.load_incluster_config()
-except config.ConfigException:
-    config.load_kube_config()
-
-apps_v1 = client.AppsV1Api()
-autoscaling_v1 = client.AutoscalingV1Api()
+apps_v1 = None
+autoscaling_v1 = None
 
 # custom type
 ScheduleActions = list[dict[str, str]]
-
-# when this is True, gracefully terminate
-shutdown = False
-# exit code to return when all threads are terminated
-exit_status_code = 0
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -54,11 +37,9 @@ class ScaleTarget(Enum):
 @dataclass
 class DeploymentStore:
     deployments: dict[tuple[str, str], ScheduleActions]
-    lock: threading.Lock
 
     def __init__(self) -> None:
         self.deployments = {}
-        self.lock = threading.Lock()
 
 
 def parse_schedules(schedules: str, identifier: tuple[str, str]) -> ScheduleActions:
@@ -98,8 +79,8 @@ def get_wait_sec() -> float:
     return (future - now).total_seconds()
 
 
-def process_deployment(
-    deployment: tuple[str, str], sa: ScheduleActions, queue: Queue
+async def process_deployment(
+    deployment: tuple[str, str], sa: ScheduleActions, queue: asyncio.Queue
 ) -> None:
     """Determine actions to run for the given deployment and list of schedules"""
     namespace, name = deployment
@@ -126,26 +107,36 @@ def process_deployment(
         # if less than 60 seconds have passed from the trigger
         if get_delta_sec(schedule_expr, schedule_timezone) < 60:
             if replicas is not None:
-                queue.put((ScaleTarget.DEPLOYMENT, name, namespace, replicas))
+                item = (ScaleTarget.DEPLOYMENT, name, namespace, replicas)
+                await queue.put(item)
+                logging.debug(f"Queue item added: {item}")
             if min_replicas is not None or max_replicas is not None:
-                queue.put(
-                    (
-                        ScaleTarget.HORIZONAL_POD_AUTOSCALER,
-                        name,
-                        namespace,
-                        min_replicas,
-                        max_replicas,
-                    )
+                item = (
+                    ScaleTarget.HORIZONAL_POD_AUTOSCALER,
+                    name,
+                    namespace,
+                    min_replicas,
+                    max_replicas,
                 )
+                await queue.put(item)
+                logging.debug(f"Queue item added: {item}")
 
 
-def scale_deployment(name: str, namespace: str, replicas: int) -> None:
+async def scale_deployment(name: str, namespace: str, replicas: int) -> None:
     """Scale the deployment to the given number of replicas"""
+    if apps_v1 is None:
+        raise ValueError("apps_v1 client not initialized")
+
     try:
         patch_body = {"spec": {"replicas": replicas}}
-        apps_v1.patch_namespaced_deployment_scale(
-            name=name, namespace=namespace, body=patch_body
+
+        await cast(
+            Coroutine,
+            apps_v1.patch_namespaced_deployment_scale(
+                name=name, namespace=namespace, body=patch_body
+            ),
         )
+
         logging.info(
             "Deployment %s/%s scaled to %s replicas", namespace, name, replicas
         )
@@ -156,10 +147,16 @@ def scale_deployment(name: str, namespace: str, replicas: int) -> None:
             logging.error("API error patching deployment %s/%s: %s", namespace, name, e)
 
 
-def scale_hpa(
-    name: str, namespace: str, min_replicas: int | None, max_replicas: int | None
+async def scale_hpa(
+    name: str,
+    namespace: str,
+    min_replicas: int | None,
+    max_replicas: int | None,
 ) -> None:
     """Adjust HPA min/max replicas via a direct patch"""
+
+    if autoscaling_v1 is None:
+        raise ValueError("autoscaling_v1 client not initialized")
 
     patch_body = {}
     if min_replicas is not None:
@@ -171,8 +168,11 @@ def scale_hpa(
         return
 
     try:
-        autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler(
-            name=name, namespace=namespace, body={"spec": patch_body}
+        await cast(
+            Coroutine,
+            autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler(
+                name=name, namespace=namespace, body={"spec": patch_body}
+            ),
         )
 
         if min_replicas:
@@ -190,6 +190,7 @@ def scale_hpa(
         else:
             logging.error("API error patching HPA %s/%s: %s", namespace, name, e)
 
+
 def process_watch_event(ds: DeploymentStore, event: dict) -> str:
     obj: dict | V1Deployment = event["object"]
     event_type = event["type"]
@@ -198,9 +199,9 @@ def process_watch_event(ds: DeploymentStore, event: dict) -> str:
     if isinstance(obj, dict):
         last_resource_version = obj["metadata"]["resourceVersion"]
     else:
-        last_resource_version = cast(str, cast(
-            V1ObjectMeta, obj.metadata
-        ).resource_version)
+        last_resource_version = cast(
+            str, cast(V1ObjectMeta, obj.metadata).resource_version
+        )
     logging.debug(f"watch last_resource_version -> {last_resource_version}")
 
     match event_type:
@@ -209,9 +210,7 @@ def process_watch_event(ds: DeploymentStore, event: dict) -> str:
                 raise ValueError(f"{event_type} event is not a V1Deployment object")
 
             metadata = cast(V1ObjectMeta, obj.metadata)
-            logging.debug(
-                f"watch {event_type}: {metadata.namespace}/{metadata.name}"
-            )
+            logging.debug(f"watch {event_type}: {metadata.namespace}/{metadata.name}")
             key = (cast(str, metadata.namespace), cast(str, metadata.name))
 
             if event_type != "DELETED" and (
@@ -220,43 +219,32 @@ def process_watch_event(ds: DeploymentStore, event: dict) -> str:
                 )
             ):
                 res = parse_schedules(schedules, key)
-                with ds.lock:
-                    ds.deployments[key] = res
+                ds.deployments[key] = res
             else:
-                with ds.lock:
-                    ds.deployments.pop(key, None)
+                ds.deployments.pop(key, None)
         case _:
             logging.debug(f"watch {event_type} {obj}")
 
     return last_resource_version
 
 
-
-def watch_deployments(ds: DeploymentStore) -> None:
+async def watch_deployments(ds: DeploymentStore):
     """Sync deployment objects between k8s api server and kube-schedule-scaler"""
-    global shutdown
-    logging.info("Starting watcher thread")
+    if apps_v1 is None:
+        raise ValueError("apps_v1 client not initialized")
+
+    logging.info("Watcher task started")
 
     w = watch.Watch()
-
     last_resource_version = None
-    while not shutdown:
+
+    while True:
         try:
-            # watch bookmarks help with having the latest resource version
-            # necessary to resume the event stream (on reconnect) without
-            # getting 410 "Resource version too old" errors
-            stream = w.stream(
+            async for event in w.stream(
                 apps_v1.list_deployment_for_all_namespaces,
                 resource_version=last_resource_version,
                 allow_watch_bookmarks=True,
-            )
-
-            for event in stream:
-                # watch can keep running for a long time so we need this here
-                if shutdown:
-                    logging.info("Watcher thread: exit")
-                    return
-
+            ):
                 if not isinstance(event, dict):
                     logging.warning(f"Skipping non dict event data: {event}")
                     continue
@@ -272,115 +260,64 @@ def watch_deployments(ds: DeploymentStore) -> None:
             if e.status == 410:
                 logging.debug("Resetting watch last_resource_version: expired")
                 last_resource_version = None
-                with ds.lock:
-                    ds.deployments.clear()
+                ds.deployments.clear()
             else:
-                logging.error(f"Watcher failed: {type(e).__name__}: {e}")
-                handle_shutdown(SIGQUIT, None, queue, exit_code=2)
-
-        except Exception as e:
-            logging.error(f"Watcher failed: {type(e).__name__}: {e}")
-            handle_shutdown(SIGQUIT, None, queue, exit_code=3)
-
-    logging.info("Watcher thread: exit")
+                raise
 
 
-class Collector:
-    # collector is wrapped in a class so that we can use the condition
-    # to notify it and wake it up on graceful shutdown
-    condition = threading.Condition()
+async def collect_scaling_jobs(ds: DeploymentStore, queue: asyncio.Queue):
+    """
+    Checks the store every minute and puts jobs into the queue.
+    """
+    logging.info("Collector task started")
 
-    @classmethod
-    def collect_scaling_jobs(cls, ds: DeploymentStore, queue: Queue) -> None:
-        """Collect scaling jobs and adds them to the queue"""
-        global shutdown
-
-        logging.info("Starting collector thread")
-
-        while not shutdown:
-            with ds.lock:
-                for deployment, schedule_action in ds.deployments.items():
-                    process_deployment(deployment, schedule_action, queue)
-            logging.debug(f"queue items: {list(queue.queue)}")
-            # wait until next minute but wake up if you have to shutdown
-            with cls.condition:
-                cls.condition.wait_for(lambda: shutdown, timeout=get_wait_sec())
-
-        logging.info("Collector thread: exit")
+    while True:
+        for deployment, schedule_action in ds.deployments.items():
+            await process_deployment(deployment, schedule_action, queue)
+        await asyncio.sleep(get_wait_sec())
 
 
-def process_scaling_jobs(queue: Queue) -> None:
+async def process_scaling_jobs(queue: asyncio.Queue) -> None:
     """Processes scaling jobs"""
-    global shutdown
-    logging.info("Starting processor thread")
+    logging.info("Processor task started")
 
-    while not shutdown:
-        # this blocks but we can add a dummy item to wake the thread
-        # if we want to shut down gracefully
-        item = queue.get()
+    while True:
+        item = await queue.get()
+        logging.debug(f"Queue item extracted: {item}")
         match item[0]:
             case ScaleTarget.DEPLOYMENT:
-                scale_deployment(*item[1:])
+                await scale_deployment(*item[1:])
             case ScaleTarget.HORIZONAL_POD_AUTOSCALER:
-                scale_hpa(*item[1:])
+                await scale_hpa(*item[1:])
+        queue.task_done()
 
-    logging.info("Processor thread: exit")
 
+async def main():
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        await config.load_kube_config()
 
-def handle_shutdown(
-    signum: int, _: FrameType | None, queue: Queue, exit_code: int
-) -> None:
-    """Handle shutdown related signals"""
-    global shutdown
-    global exit_status_code
+    global apps_v1, autoscaling_v1
 
-    if shutdown:
-        # it means it's been already triggered by another signal before
-        # no need to do the work twice and it can cause issues
-        return
+    async with client.ApiClient() as api_client:
+        apps_v1 = client.AppsV1Api(api_client)
+        autoscaling_v1 = client.AutoscalingV1Api(api_client)
 
-    sig_str = strsignal(signum)
-    sig_str = sig_str.split(":")[0] if sig_str else "Unknown"
-    logging.info(f"Received {sig_str}: exiting gracefully")
-    shutdown = True
-    # wake up the processor
-    queue.put("notify")
-    # wake up the collector
-    with Collector.condition:
-        Collector.condition.notify()
-    exit_status_code = exit_code
+        ds = DeploymentStore()
+        queue = asyncio.Queue()
+
+        tasks = [
+            asyncio.create_task(watch_deployments(ds)),
+            asyncio.create_task(collect_scaling_jobs(ds, queue)),
+            asyncio.create_task(process_scaling_jobs(queue)),
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logging.info("Interrupted")
 
 
 if __name__ == "__main__":
-    ds = DeploymentStore()
-    queue = Queue()
-
-    signal(SIGTERM, partial(handle_shutdown, queue=queue, exit_code=143))
-    signal(SIGINT, partial(handle_shutdown, queue=queue, exit_code=130))
-    signal(SIGQUIT, partial(handle_shutdown, queue=queue, exit_code=131))
-    signal(SIGABRT, partial(handle_shutdown, queue=queue, exit_code=134))
-
-    # for the watcher, we use a daemon thread so that it won't block graceful shutdown
-    # since there's no easy way to interrupt a watch and the thread could
-    # sleep for a long time
-    threading.Thread(target=watch_deployments, args=[ds], daemon=True).start()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(Collector.collect_scaling_jobs, ds, queue): "collector",
-            executor.submit(process_scaling_jobs, queue): "processor",
-        }
-
-        # NOTE: block waiting for the tasks, but report their success or failure as
-        # soon as each individual one completes
-        for future in concurrent.futures.as_completed(futures):
-            task_name = futures[future]
-            try:
-                result = future.result()
-                logging.debug(f"success: {task_name}: {result}")
-            except Exception as e:
-                logging.error(f"failure: task {task_name}: {type(e).__name__}: {e}")
-                handle_shutdown(SIGQUIT, None, queue, exit_code=1)
-
-    # expliticly return the correct status code since we're trapping signals
-    exit(exit_status_code)
+    asyncio.run(main())

@@ -1,9 +1,9 @@
-from queue import Queue
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from freezegun import freeze_time
-from kubernetes.client.models import V1Deployment, V1ObjectMeta
+from kubernetes_asyncio.client.models import V1Deployment, V1ObjectMeta
 
 
 @pytest.fixture
@@ -11,9 +11,14 @@ def ds():
     return DeploymentStore()
 
 
+@pytest.fixture
+def queue():
+    return asyncio.Queue()
+
+
 with (
-    patch("kubernetes.config.load_incluster_config"),
-    patch("kubernetes.config.load_kube_config"),
+    patch("kubernetes_asyncio.config.load_incluster_config"),
+    patch("kubernetes_asyncio.config.load_kube_config"),
 ):
     from schedule_scaling.main import (
         DeploymentStore,
@@ -163,107 +168,94 @@ def test_process_event_bookmark(ds):
     assert len(ds.deployments) == 0
 
 
+@pytest.mark.asyncio
 @freeze_time("2024-01-01 09:00:10")
-def test_process_deployment_queue_deployment():
-    queue = Queue()
-
+async def test_process_deployment_queue_deployment(queue):
     deployment_key = ("prod", "web")
     # Only replicas is set
     schedule_actions = [{"schedule": "0 9 * * *", "replicas": "10"}]
 
-    process_deployment(deployment_key, schedule_actions, queue)
+    await process_deployment(deployment_key, schedule_actions, queue)
 
     assert queue.qsize() == 1
-    item = queue.get()
+    item = await queue.get()
     assert item == (ScaleTarget.DEPLOYMENT, "web", "prod", 10)
 
 
+@pytest.mark.asyncio
 @freeze_time("2024-01-01 09:00:10")
-def test_process_deployment_queue_hpa():
-    queue = Queue()
-
+async def test_process_deployment_queue_hpa(queue):
     deployment_key = ("prod", "web")
     # Only minReplicas and maxReplicas are set
     schedule_actions = [
         {"schedule": "0 9 * * *", "minReplicas": "2", "maxReplicas": "20"}
     ]
 
-    process_deployment(deployment_key, schedule_actions, queue)
+    await process_deployment(deployment_key, schedule_actions, queue)
 
     assert queue.qsize() == 1
-    item = queue.get()
+    item = await queue.get()
     assert item == (ScaleTarget.HORIZONAL_POD_AUTOSCALER, "web", "prod", 2, 20)
 
 
+@pytest.mark.asyncio
 @freeze_time("2024-01-01 08:55:00")
-def test_process_deployment_too_early_no_queue():
-    queue = Queue()
+async def test_process_deployment_too_early_no_queue(queue):
     deployment_key = ("prod", "web")
     schedule_actions = [{"schedule": "0 9 * * *", "replicas": "10"}]
 
-    process_deployment(deployment_key, schedule_actions, queue)
+    await process_deployment(deployment_key, schedule_actions, queue)
 
     # Nothing should be in the queue because delta is 5 mins
     assert queue.qsize() == 0
 
 
-@patch("schedule_scaling.main.apps_v1.patch_namespaced_deployment_scale")
-def test_scale_deployment_calls_api(mock_patch):
-    scale_deployment("my-deploy", "my-ns", 3)
+@pytest.mark.asyncio
+@patch("schedule_scaling.main.apps_v1", new_callable=AsyncMock)
+async def test_scale_deployment_calls_api(mock_apps_v1):
+    await scale_deployment("my-deploy", "my-ns", 3)
 
     # Verify the k8s python client was called with correct body
-    mock_patch.assert_called_once_with(
+    mock_apps_v1.patch_namespaced_deployment_scale.assert_called_once_with(
         name="my-deploy", namespace="my-ns", body={"spec": {"replicas": 3}}
     )
 
 
-@patch(
-    "schedule_scaling.main.autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler"
-)
-def test_scale_hpa_calls_api(mock_patch):
+@pytest.mark.asyncio
+@patch("schedule_scaling.main.autoscaling_v1", new_callable=AsyncMock)
+async def test_scale_hpa_calls_api(mock_autoscaling_v1):
     from schedule_scaling.main import scale_hpa
 
     # Test case: both min and max replicas provided
-    scale_hpa("my-hpa", "my-ns", min_replicas=2, max_replicas=10)
+    await scale_hpa("my-hpa", "my-ns", min_replicas=2, max_replicas=10)
 
     # Verify the HPA client was called with the correct nested spec body
-    mock_patch.assert_called_once_with(
+    mock_autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler.assert_called_once_with(
         name="my-hpa",
         namespace="my-ns",
         body={"spec": {"minReplicas": 2, "maxReplicas": 10}},
     )
 
 
-@patch(
-    "schedule_scaling.main.autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler"
-)
-def test_scale_hpa_partial_patch_min_replicas(mock_patch):
+@pytest.mark.asyncio
+@patch("schedule_scaling.main.autoscaling_v1", new_callable=AsyncMock)
+async def test_scale_hpa_partial_patch_min_replicas(mock_autoscaling_v1):
     # Test case: Only min_replicas is provided
-    scale_hpa("partial-hpa", "my-ns", min_replicas=5, max_replicas=None)
+    await scale_hpa("partial-hpa", "my-ns", min_replicas=5, max_replicas=None)
 
     # Verify that the patch body only contains the provided field
-    mock_patch.assert_called_once_with(
+    mock_autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler.assert_called_once_with(
         name="partial-hpa", namespace="my-ns", body={"spec": {"minReplicas": 5}}
     )
 
 
-@patch(
-    "schedule_scaling.main.autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler"
-)
-def test_scale_hpa_partial_patch_max_replicas(mock_patch):
+@pytest.mark.asyncio
+@patch("schedule_scaling.main.autoscaling_v1", new_callable=AsyncMock)
+async def test_scale_hpa_partial_patch_max_replicas(mock_autoscaling_v1):
     # Test case: Only max_replicas is provided
-    scale_hpa("partial-hpa", "my-ns", min_replicas=None, max_replicas=5)
+    await scale_hpa("partial-hpa", "my-ns", min_replicas=None, max_replicas=5)
 
     # Verify that the patch body only contains the provided field
-    mock_patch.assert_called_once_with(
+    mock_autoscaling_v1.patch_namespaced_horizontal_pod_autoscaler.assert_called_once_with(
         name="partial-hpa", namespace="my-ns", body={"spec": {"maxReplicas": 5}}
     )
-
-
-def test_deployment_store_lock():
-    ds = DeploymentStore()
-    assert ds.deployments == {}
-    # Ensure lock exists
-    assert not ds.lock.locked()
-    with ds.lock:
-        assert ds.lock.locked()

@@ -1,2 +1,2 @@
-kubernetes==34.1.0
+kubernetes_asyncio==33.3.0
 croniter==2.0.7
