@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Coroutine, cast
@@ -19,8 +18,9 @@ from kubernetes_asyncio.client.rest import ApiException
 apps_v1 = None
 autoscaling_v1 = None
 
-# custom type
+# custom types
 ScheduleActions = list[dict[str, str]]
+DeploymentStore = dict[tuple[str, str], ScheduleActions]
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -32,14 +32,6 @@ logging.basicConfig(
 class ScaleTarget(Enum):
     DEPLOYMENT = 0
     HORIZONAL_POD_AUTOSCALER = 1
-
-
-@dataclass
-class DeploymentStore:
-    deployments: dict[tuple[str, str], ScheduleActions]
-
-    def __init__(self) -> None:
-        self.deployments = {}
 
 
 def parse_schedules(schedules: str, identifier: tuple[str, str]) -> ScheduleActions:
@@ -219,9 +211,9 @@ def process_watch_event(ds: DeploymentStore, event: dict) -> str:
                 )
             ):
                 res = parse_schedules(schedules, key)
-                ds.deployments[key] = res
+                ds[key] = res
             else:
-                ds.deployments.pop(key, None)
+                ds.pop(key, None)
         case _:
             logging.debug(f"watch {event_type} {obj}")
 
@@ -251,7 +243,7 @@ async def watch_deployments(ds: DeploymentStore):
 
                 last_resource_version = process_watch_event(ds, event)
 
-                logging.debug(f"Deployments: {ds.deployments}")
+                logging.debug(f"Deployments: {ds}")
 
         except ApiException as e:
             logging.error(f"Kubernetes API error: {e}")
@@ -260,7 +252,7 @@ async def watch_deployments(ds: DeploymentStore):
             if e.status == 410:
                 logging.debug("Resetting watch last_resource_version: expired")
                 last_resource_version = None
-                ds.deployments.clear()
+                ds.clear()
             else:
                 raise
 
@@ -272,7 +264,7 @@ async def collect_scaling_jobs(ds: DeploymentStore, queue: asyncio.Queue):
     logging.info("Collector task started")
 
     while True:
-        for deployment, schedule_action in ds.deployments.items():
+        for deployment, schedule_action in ds.items():
             await process_deployment(deployment, schedule_action, queue)
         await asyncio.sleep(get_wait_sec())
 

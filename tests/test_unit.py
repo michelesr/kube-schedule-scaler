@@ -103,14 +103,14 @@ def test_process_event_added_with_schedule(ds):
     process_watch_event(ds, event)
 
     key = ("default", "app-1")
-    assert key in ds.deployments
-    assert ds.deployments[key][0]["replicas"] == 5
+    assert key in ds
+    assert ds[key][0]["replicas"] == 5
 
 
 def test_process_event_modified_updates_store(ds):
     key = ("default", "app-1")
     # Initial state
-    ds.deployments[key] = [{"schedule": "old", "replicas": 1}]
+    ds[key] = [{"schedule": "old", "replicas": 1}]
 
     # Update event
     new_json = '[{"schedule": "new", "replicas": 10}]'
@@ -120,31 +120,31 @@ def test_process_event_modified_updates_store(ds):
 
     process_watch_event(ds, event)
 
-    assert ds.deployments[key][0]["replicas"] == 10
+    assert ds[key][0]["replicas"] == 10
 
 
 def test_process_event_deleted_removes_from_store(ds):
     # PRE-CONDITION: Manually seed the store
     key = ("default", "app-1")
-    ds.deployments[key] = [{"schedule": "* * * * *", "replicas": 1}]
+    ds[key] = [{"schedule": "* * * * *", "replicas": 1}]
 
     # Verify it is actually there first (Sanity check)
-    assert key in ds.deployments
+    assert key in ds
 
     # ACTION: Process the DELETED event
     event = create_mock_event("DELETED", "app-1", "default")
     process_watch_event(ds, event)
 
     # POST-CONDITION: Verify it was removed
-    assert key not in ds.deployments
+    assert key not in ds
 
 
 def test_process_event_annotation_removed(ds):
     # PRE-CONDITION: Deployment exists with a schedule
     key = ("default", "app-1")
-    ds.deployments[key] = [{"schedule": "0 9 * * *", "replicas": 5}]
+    ds[key] = [{"schedule": "0 9 * * *", "replicas": 5}]
 
-    assert key in ds.deployments
+    assert key in ds
 
     # ACTION: Process a MODIFIED event where the annotation is missing
     # (Simulates a user running 'kubectl annotate deploy app-1 zalando.org/schedule-actions-')
@@ -153,7 +153,7 @@ def test_process_event_annotation_removed(ds):
     process_watch_event(ds, event)
 
     # POST-CONDITION: The store should now be empty for this key
-    assert key not in ds.deployments
+    assert key not in ds
 
 
 def test_process_event_bookmark(ds):
@@ -165,7 +165,7 @@ def test_process_event_bookmark(ds):
 
     # This should not crash and should not modify deployments
     process_watch_event(ds, event)
-    assert len(ds.deployments) == 0
+    assert len(ds) == 0
 
 
 @pytest.mark.asyncio
