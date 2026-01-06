@@ -1,6 +1,6 @@
 # Architecture of kube-schedule-scaler
 
-![Diagram](diagram.png)
+![Diagram](diagram.svg)
 
 ## Components
 
@@ -16,7 +16,7 @@
 
 **Role**: Acts as the single source of truth for the application.
 
-**Implementation**: A thread-safe dictionary (protected by a `threading.Lock`) that maps deployment identifiers `(namespace, name)` to their parsed schedule actions.
+**Implementation**: A dictionary that maps deployment identifiers `(namespace, name)` to their parsed schedule actions.
 
 ### Collector
 
@@ -30,7 +30,7 @@
 
 **Role**: Decouples the decision-making (Collector) from the execution (Processor).
 
-**Implementation**: A `queue.Queue` (FIFO) that ensures scaling actions are processed in order and provides backpressure if the API server is slow.
+**Implementation**: A `asyncio.Queue` (FIFO) that ensures scaling actions are processed in order and asyncronously
 
 ### Processor
 
