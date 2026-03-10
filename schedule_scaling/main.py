@@ -5,9 +5,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import socket
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from queue import Queue
@@ -30,6 +31,8 @@ except config.ConfigException:
 
 apps_v1 = client.AppsV1Api()
 autoscaling_v1 = client.AutoscalingV1Api()
+coordination_v1 = client.CoordinationV1Api()
+authorization_v1 = client.AuthorizationV1Api()
 
 # custom type
 ScheduleActions = list[dict[str, str]]
@@ -38,6 +41,22 @@ ScheduleActions = list[dict[str, str]]
 shutdown = False
 # exit code to return when all threads are terminated
 exit_status_code = 0
+
+# Leader election state:
+# - is_leader: True when this instance holds the lease (or lease election is disabled)
+# - When lease RBAC permissions are absent, is_leader is set to True permanently
+#   so the controller behaves as before (all replicas schedule).
+is_leader = False
+
+# Leader election configuration (tunable via env vars)
+# Defaults mirror the client-go leader election defaults:
+#   LeaseDuration=15s, RenewDeadline=10s, RetryPeriod/RenewInterval=5s
+# Constraint: LEASE_DURATION_SEC > LEASE_RENEW_DEADLINE_SEC > LEASE_RENEW_INTERVAL_SEC
+LEASE_NAME = os.environ.get("LEASE_NAME", "kube-schedule-scaler")
+LEASE_DURATION_SEC = int(os.environ.get("LEASE_DURATION_SEC", "15"))
+LEASE_RENEW_DEADLINE_SEC = int(os.environ.get("LEASE_RENEW_DEADLINE_SEC", "10"))
+LEASE_RENEW_INTERVAL_SEC = int(os.environ.get("LEASE_RENEW_INTERVAL_SEC", "5"))
+LEASE_RETRY_INTERVAL_SEC = int(os.environ.get("LEASE_RETRY_INTERVAL_SEC", "10"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -59,6 +78,264 @@ class DeploymentStore:
     def __init__(self) -> None:
         self.deployments = {}
         self.lock = threading.Lock()
+
+
+def get_controller_namespace() -> str:
+    """Determine the namespace the controller runs in.
+
+    Priority:
+    1. The projected service account namespace file (in-cluster)
+    2. LEASE_NAMESPACE environment variable
+    3. Hardcoded default 'kube-schedule-scaler'
+    """
+    sa_ns_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    try:
+        with open(sa_ns_file) as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    return os.environ.get("LEASE_NAMESPACE", "kube-schedule-scaler")
+
+
+def check_lease_permission(namespace: str) -> bool:
+    """Return True if the running identity has the RBAC permissions needed for
+    leader election: get, create, and update on leases in coordination.k8s.io."""
+    try:
+        for verb in ("get", "create", "update"):
+            sar = client.V1SelfSubjectAccessReview(
+                spec=client.V1SelfSubjectAccessReviewSpec(
+                    resource_attributes=client.V1ResourceAttributes(
+                        group="coordination.k8s.io",
+                        resource="leases",
+                        verb=verb,
+                        namespace=namespace,
+                    )
+                )
+            )
+            resp = cast(
+                client.V1SelfSubjectAccessReview,
+                authorization_v1.create_self_subject_access_review(body=sar),
+            )
+            if not cast(client.V1SubjectAccessReviewStatus, resp.status).allowed:
+                logging.debug("Lease permission check: verb '%s' not allowed", verb)
+                return False
+        return True
+    except Exception as e:
+        logging.debug("Lease permission check failed with exception: %s", e)
+        return False
+
+
+class LeaderElection:
+    """Runs a continuous leader election loop using a Kubernetes Lease object.
+
+    The global ``is_leader`` flag is set to True only while this instance holds
+    the lease.  A condition variable is used so that ``handle_shutdown`` can
+    wake the thread immediately.
+    """
+
+    condition = threading.Condition()
+
+    @classmethod
+    def run(cls, namespace: str) -> None:
+        global is_leader, shutdown
+
+        identity = os.environ.get("HOSTNAME") or socket.gethostname()
+        logging.info(
+            "Starting leader election thread (identity=%s, lease=%s/%s)",
+            identity,
+            namespace,
+            LEASE_NAME,
+        )
+
+        # Tracks when a continuous run of renewal failures started.
+        # None means the last operation was successful.
+        renew_failure_since: datetime | None = None
+
+        while not shutdown:
+            try:
+                try:
+                    lease = cast(
+                        client.V1Lease,
+                        coordination_v1.read_namespaced_lease(
+                            name=LEASE_NAME, namespace=namespace
+                        ),
+                    )
+                    spec = cast(client.V1LeaseSpec, lease.spec or client.V1LeaseSpec())
+                    holder = spec.holder_identity
+                    renew_time: datetime | None = spec.renew_time
+                    duration = spec.lease_duration_seconds or LEASE_DURATION_SEC
+
+                    now = datetime.now(timezone.utc)
+
+                    # Lease is expired when the holder hasn't renewed within the duration
+                    if renew_time is not None and renew_time.tzinfo is None:
+                        renew_time = renew_time.replace(tzinfo=timezone.utc)
+                    expired = (
+                        renew_time is None
+                        or (now - renew_time).total_seconds() > duration
+                    )
+
+                    if holder == identity or expired:
+                        # Acquire or renew
+                        transitions = spec.lease_transitions or 0
+                        if expired and holder != identity:
+                            transitions += 1
+                            spec.acquire_time = now
+                            logging.info(
+                                "Lease expired (held by %s) — acquiring (transition #%d)",
+                                holder,
+                                transitions,
+                            )
+                        spec.holder_identity = identity
+                        spec.lease_duration_seconds = LEASE_DURATION_SEC
+                        spec.renew_time = now
+                        spec.lease_transitions = transitions
+                        lease.spec = spec
+                        coordination_v1.replace_namespaced_lease(
+                            name=LEASE_NAME, namespace=namespace, body=lease
+                        )
+                        # Successful write — reset failure clock
+                        renew_failure_since = None
+                        if not is_leader:
+                            logging.info("Became leader")
+                            is_leader = True
+                            with Collector.condition:
+                                Collector.condition.notify()
+                        else:
+                            is_leader = True  # renewal — no notify
+                    else:
+                        if is_leader:
+                            logging.info(
+                                "Lost leadership — lease now held by %s", holder
+                            )
+                        is_leader = False
+                        renew_failure_since = None
+
+                except ApiException as e:
+                    if e.status == 404:
+                        # Lease does not exist yet — create it
+                        now = datetime.now(timezone.utc)
+                        new_lease = client.V1Lease(
+                            metadata=client.V1ObjectMeta(
+                                name=LEASE_NAME, namespace=namespace
+                            ),
+                            spec=client.V1LeaseSpec(
+                                holder_identity=identity,
+                                lease_duration_seconds=LEASE_DURATION_SEC,
+                                acquire_time=now,
+                                renew_time=now,
+                                lease_transitions=0,
+                            ),
+                        )
+                        coordination_v1.create_namespaced_lease(
+                            namespace=namespace, body=new_lease
+                        )
+                        renew_failure_since = None
+                        logging.info("Created lease and became leader")
+                        is_leader = True
+                        with Collector.condition:
+                            Collector.condition.notify()
+                    elif e.status == 409:
+                        # Conflict on replace — another instance just acquired it
+                        logging.debug("Lease update conflict — will retry")
+                        is_leader = False
+                        renew_failure_since = None
+                    else:
+                        logging.error("Lease API error: %s", e)
+                        renew_failure_since = cls._handle_renew_failure(
+                            renew_failure_since, is_leader
+                        )
+                        if renew_failure_since is None:
+                            is_leader = False
+
+            except Exception as e:
+                logging.error("Leader election error: %s", e)
+                renew_failure_since = cls._handle_renew_failure(
+                    renew_failure_since, is_leader
+                )
+                if renew_failure_since is None:
+                    is_leader = False
+
+            wait = LEASE_RENEW_INTERVAL_SEC if is_leader else LEASE_RETRY_INTERVAL_SEC
+            with cls.condition:
+                cls.condition.wait(timeout=wait)
+
+        # Release the lease on graceful shutdown so other instances can take
+        # over immediately rather than waiting for the full LEASE_DURATION_SEC.
+        if is_leader:
+            cls._release_lease(namespace, identity)
+        is_leader = False
+        logging.info("Leader election thread: exit")
+
+    @classmethod
+    def _handle_renew_failure(
+        cls, renew_failure_since: datetime | None, currently_leader: bool
+    ) -> datetime | None:
+        """Track consecutive renewal failures against the deadline.
+
+        Returns the updated ``renew_failure_since`` value:
+        - If the deadline has been exceeded (or we were never leader), returns
+          ``None`` to signal that leadership should be dropped.
+        - Otherwise returns the timestamp when failures started.
+        """
+        if not currently_leader:
+            # Non-leaders don't have a deadline — just keep retrying.
+            return renew_failure_since
+
+        now = datetime.now(timezone.utc)
+        if renew_failure_since is None:
+            logging.warning(
+                "Failed to renew lease — will retry for up to %ds before yielding",
+                LEASE_RENEW_DEADLINE_SEC,
+            )
+            return now
+
+        elapsed = (now - renew_failure_since).total_seconds()
+        if elapsed >= LEASE_RENEW_DEADLINE_SEC:
+            logging.warning(
+                "Failed to renew lease for %.1fs (deadline=%ds) — yielding leadership",
+                elapsed,
+                LEASE_RENEW_DEADLINE_SEC,
+            )
+            return None  # signal: drop leadership
+
+        logging.debug(
+            "Renewal failure ongoing for %.1fs (deadline=%ds)",
+            elapsed,
+            LEASE_RENEW_DEADLINE_SEC,
+        )
+        return renew_failure_since  # keep waiting
+
+    @classmethod
+    def _release_lease(cls, namespace: str, identity: str) -> None:
+        """Best-effort: write the lease with duration=1s and no holder so other
+        instances can take over immediately after shutdown."""
+        try:
+            lease = cast(
+                client.V1Lease,
+                coordination_v1.read_namespaced_lease(
+                    name=LEASE_NAME, namespace=namespace
+                ),
+            )
+            spec = cast(client.V1LeaseSpec, lease.spec or client.V1LeaseSpec())
+            # Only release if we still own it — another instance may have
+            # already taken over during a slow shutdown.
+            if spec.holder_identity != identity:
+                logging.debug(
+                    "Lease already held by %s — skipping release", spec.holder_identity
+                )
+                return
+            now = datetime.now(timezone.utc)
+            spec.holder_identity = ""
+            spec.lease_duration_seconds = 1
+            spec.renew_time = now
+            lease.spec = spec
+            coordination_v1.replace_namespaced_lease(
+                name=LEASE_NAME, namespace=namespace, body=lease
+            )
+            logging.info("Released lease on shutdown")
+        except Exception as e:
+            logging.warning("Failed to release lease on shutdown (best-effort): %s", e)
 
 
 def parse_schedules(schedules: str, identifier: tuple[str, str]) -> ScheduleActions:
@@ -303,12 +580,15 @@ class Collector:
                 # work on a copy so that we can release the lock sooner
                 deployments = ds.deployments.copy()
 
-            for deployment, schedule_action in deployments.items():
-                process_deployment(deployment, schedule_action, queue)
+            if is_leader:
+                for deployment, schedule_action in deployments.items():
+                    process_deployment(deployment, schedule_action, queue)
+            else:
+                logging.debug("Not the leader — skipping job collection")
             logging.debug(f"queue items: {list(queue.queue)}")
             # wait until next minute but wake up if you have to shutdown
             with cls.condition:
-                cls.condition.wait_for(lambda: shutdown, timeout=get_wait_sec())
+                cls.condition.wait(timeout=get_wait_sec())
 
         logging.info("Collector thread: exit")
 
@@ -352,6 +632,9 @@ def handle_shutdown(
     # wake up the collector
     with Collector.condition:
         Collector.condition.notify()
+    # wake up the leader election thread
+    with LeaderElection.condition:
+        LeaderElection.condition.notify()
     exit_status_code = exit_code
 
 
@@ -364,16 +647,34 @@ if __name__ == "__main__":
     signal(SIGQUIT, partial(handle_shutdown, queue=queue, exit_code=131))
     signal(SIGABRT, partial(handle_shutdown, queue=queue, exit_code=134))
 
+    lease_namespace = get_controller_namespace()
+    lease_election_enabled = check_lease_permission(lease_namespace)
+
+    if lease_election_enabled:
+        logging.info(
+            f"Lease RBAC check passed — leader election enabled (namespace={lease_namespace})"
+        )
+    else:
+        logging.warning(
+            "Lease RBAC check failed — leader election disabled" 
+        )
+        is_leader = True
+
     # for the watcher, we use a daemon thread so that it won't block graceful shutdown
     # since there's no easy way to interrupt a watch and the thread could
     # sleep for a long time
     threading.Thread(target=watch_deployments, args=[ds, queue], daemon=True).start()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    # leader election runs in the executor so the process won't exit until it
+    # completes, ensuring _release_lease always has a chance to run
+    max_workers = 3
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(Collector.collect_scaling_jobs, ds, queue): "collector",
             executor.submit(process_scaling_jobs, queue): "processor",
         }
+        if lease_election_enabled:
+            futures[executor.submit(LeaderElection.run, lease_namespace)] = "leader-election"
 
         # NOTE: block waiting for the tasks, but report their success or failure as
         # soon as each individual one completes

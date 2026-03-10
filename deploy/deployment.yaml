@@ -41,6 +41,9 @@ rules:
 - apiGroups: ["autoscaling", "extensions"]
   resources: ["horizontalpodautoscalers"]
   verbs: ["get", "list", "patch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
 ---
 apiVersion: apps/v1
 kind: Deployment
